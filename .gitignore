@@ -1,0 +1,6 @@
+# Virtual environment and system files
+tarvis_env/
+.DS_Store
+*.pyc
+# PDFs
+*.pdf

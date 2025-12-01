@@ -1,0 +1,19 @@
+# Core ML frameworks
+torch==1.13.1
+torchvision==0.14.1
+
+# Project dependencies
+colorama==0.4.5
+einops==0.4.1
+fvcore==0.1.5.post20220512
+imgaug==0.4.0
+numpy==1.23.5
+opencv_python==4.6.0.66
+git+https://github.com/cocodataset/panopticapi.git
+Pillow==9.5.0
+PyYAML==6.0
+scipy==1.9.3
+tensorflow-macos==2.13.0
+timm==0.5.4
+tqdm==4.64.0
+wandb==0.13.0
