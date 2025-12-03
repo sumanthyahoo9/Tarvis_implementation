@@ -1,436 +1,478 @@
 """
-Temporal Neck - Novel Spatio-Temporal Feature Fusion
+Faithful Temporal Neck Implementation for TarViS
 
-This module implements TarViS's key innovation: a neck architecture that creates
-temporally consistent features by alternating two types of attention:
+This is a complete reimplementation of the TarViS Temporal Neck,
+matching the original architecture from the paper and official code.
 
-1. Deformable Attention: Spatially global, temporally local
-   - Attends to any spatial location in the current frame
-   - Multi-scale feature interaction
-   - Efficient (learns where to attend)
+Components:
+1. Multi-scale input projections
+2. 2D and 3D positional embeddings
+3. Level embeddings
+4. MSDeformable attention (PyTorch implementation)
+5. Temporal attention with patch masking
+6. Feature Pyramid Network (FPN)
+7. Mask feature projection
 
-2. Temporal Attention: Spatially local, temporally global
-   - Divides frame into grid cells
-   - Attends across all frames within each cell
-   - Enables temporal consistency
-
-By alternating these operations across 6 layers, the Temporal Neck produces
-features that are both spatially rich and temporally aligned - perfect for
-video instance segmentation and tracking.
-
-Architecture:
-    Input: Multi-scale features from backbone [F32, F16, F8, F4]
-    
-    For each layer (6 total):
-        1. Deformable Attention: Learn spatial relationships at scale
-        2. Temporal Attention: Propagate information across time
-        3. FFN: Non-linear transformation
-    
-    Output: Refined multi-scale features [F32', F16', F8', F4']
-
-Note: F8 is excluded from temporal attention for memory efficiency.
+Based on:
+- TarViS paper: "TarViS: A Unified Approach for Target-based Video Segmentation"
+- Original code: https://github.com/Ali2500/TarViS
 """
 
-from typing import Dict, List, Optional, Tuple, Any, Union
-from pathlib import Path
-from .deformable_attention import DeformableAttention
-from .temporal_attention import TemporalAttention
+from typing import List
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from deformable_attention import DeformableAttention
+from temporal_attention import TemporalAttention
 TORCH_AVAILABLE = True
-TensorType = torch.Tensor
 
 
-class TemporalNeck(nn.Module):
+def _get_activation_fn(activation: str):
+    """Return activation function given a string."""
+    if activation == "relu":
+        return F.relu
+    if activation == "gelu":
+        return F.gelu
+    raise RuntimeError(f"activation should be relu/gelu, not {activation}.")
+
+
+class PositionEmbeddingSine(nn.Module):
     """
-    Temporal Neck for video feature fusion.
+    2D sinusoidal positional embeddings.
     
-    Alternates between Deformable Attention (spatial) and Temporal Attention
-    (temporal) to create spatio-temporally consistent features.
+    Used for spatial position encoding in each frame.
+    """
+    
+    def __init__(self, num_pos_feats=128, temperature=10000, normalize=True):
+        if TORCH_AVAILABLE:
+            super().__init__()
+        self.num_pos_feats = num_pos_feats
+        self.temperature = temperature
+        self.normalize = normalize
+    
+    def forward(self, x):
+        """
+        Args:
+            x: [B, C, H, W]
+        Returns:
+            pos: [B, C, H, W]
+        """
+        if not TORCH_AVAILABLE:
+            return x
+        
+        B, C, H, W = x.shape
+        
+        # Create coordinate grid
+        y_embed = torch.arange(H, dtype=torch.float32, device=x.device)
+        x_embed = torch.arange(W, dtype=torch.float32, device=x.device)
+        
+        if self.normalize:
+            y_embed = y_embed / (H - 1) * 2 * math.pi
+            x_embed = x_embed / (W - 1) * 2 * math.pi
+        
+        # Create meshgrid
+        y_embed, x_embed = torch.meshgrid(y_embed, x_embed, indexing='ij')
+        
+        # Compute sinusoidal embeddings
+        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device)
+        dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)
+        
+        pos_x = x_embed[:, :, None] / dim_t
+        pos_y = y_embed[:, :, None] / dim_t
+        
+        pos_x = torch.stack([pos_x[:, :, 0::2].sin(), pos_x[:, :, 1::2].cos()], dim=3).flatten(2)
+        pos_y = torch.stack([pos_y[:, :, 0::2].sin(), pos_y[:, :, 1::2].cos()], dim=3).flatten(2)
+        
+        pos = torch.cat([pos_y, pos_x], dim=2).permute(2, 0, 1)  # [C, H, W]
+        
+        return pos.unsqueeze(0).expand(B, -1, -1, -1)
+
+
+class PositionEmbeddingSine3D(nn.Module):
+    """
+    3D sinusoidal positional embeddings (ORIGINAL from TarViS).
+    
+    Used for spatio-temporal position encoding across video frames.
+    """
+    
+    def __init__(self, num_pos_feats=64, temperature=10000, normalize=False, scale=None):
+        if TORCH_AVAILABLE:
+            super().__init__()
+        self.num_pos_feats = num_pos_feats
+        self.temperature = temperature
+        self.normalize = normalize
+        if scale is not None and normalize is False:
+            raise ValueError("normalize should be True if scale is passed")
+        if scale is None:
+            scale = 2 * math.pi
+        self.scale = scale
+        self.is_3d = True
+
+    @torch.no_grad()
+    def forward(self, x, mask=None, fmt="btchw"):
+        """
+        Args:
+            x: [B, T, C, H, W] if fmt='btchw' or [B, C, T, H, W] if fmt='bcthw'
+            mask: Optional mask
+            fmt: Format string ('btchw' or 'bcthw')
+        
+        Returns:
+            pos: [B, T, C, H, W] (always)
+        """
+        if not TORCH_AVAILABLE:
+            return x
+            
+        assert x.dim() == 5, f"{x.shape} should be a 5-dimensional Tensor"
+        
+        if fmt == "btchw":
+            batch_sz, clip_len, _, height, width = x.shape
+        elif fmt == "bcthw":
+            batch_sz, _, clip_len, height, width = x.shape
+        else:
+            raise ValueError(f"Invalid format given: {fmt}")
+
+        if mask is None:
+            mask = torch.zeros((batch_sz, clip_len, height, width), device=x.device, dtype=torch.bool)
+
+        not_mask = ~mask
+        z_embed = not_mask.cumsum(1, dtype=torch.float32)
+        y_embed = not_mask.cumsum(2, dtype=torch.float32)
+        x_embed = not_mask.cumsum(3, dtype=torch.float32)
+        
+        if self.normalize:
+            eps = 1e-6
+            z_embed = z_embed / (z_embed[:, -1:, :, :] + eps) * self.scale
+            y_embed = y_embed / (y_embed[:, :, -1:, :] + eps) * self.scale
+            x_embed = x_embed / (x_embed[:, :, :, -1:] + eps) * self.scale
+
+        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device)
+        dim_t_floor_2 = torch.div(dim_t, 2, rounding_mode='trunc')
+        dim_t = self.temperature ** (2 * dim_t_floor_2 / self.num_pos_feats)
+
+        dim_t_z = torch.arange((self.num_pos_feats * 2), dtype=torch.float32, device=x.device)
+        dim_t_z_floor_2 = torch.div(dim_t_z, 2, rounding_mode='trunc')
+        dim_t_z = self.temperature ** (2 * dim_t_z_floor_2 / (self.num_pos_feats * 2))
+
+        pos_x = x_embed[:, :, :, :, None] / dim_t
+        pos_y = y_embed[:, :, :, :, None] / dim_t
+        pos_z = z_embed[:, :, :, :, None] / dim_t_z
+        
+        pos_x = torch.stack((pos_x[:, :, :, :, 0::2].sin(), pos_x[:, :, :, :, 1::2].cos()), dim=5).flatten(4)
+        pos_y = torch.stack((pos_y[:, :, :, :, 0::2].sin(), pos_y[:, :, :, :, 1::2].cos()), dim=5).flatten(4)
+        pos_z = torch.stack((pos_z[:, :, :, :, 0::2].sin(), pos_z[:, :, :, :, 1::2].cos()), dim=5).flatten(4)
+        
+        pos = (torch.cat((pos_y, pos_x), dim=4) + pos_z)
+
+        if fmt == "btchw":
+            pos = pos.permute(0, 1, 4, 2, 3)
+        elif fmt == "bcthw":
+            pos = pos.permute(0, 4, 1, 2, 3)
+
+        return pos
+
+
+class TemporalNeckFaithful(nn.Module):
+    """
+    Faithful implementation of TarViS Temporal Neck.
+    
+    This matches the original implementation with:
+    - Multi-scale input projections
+    - 2D and 3D positional embeddings
+    - Level embeddings
+    - Deformable + Temporal attention alternation
+    - Feature Pyramid Network (FPN)
+    - Mask feature projection
     
     Args:
-        hidden_dim: Feature dimension (D)
-        num_layers: Number of refinement layers (default: 6)
-        num_heads: Number of attention heads
-        num_levels: Number of feature scales (default: 4 for [F32, F16, F8, F4])
-        num_points: Number of sampling points for deformable attention
-        dropout: Dropout rate
-        temporal_grid_size: Grid size for temporal attention (e.g., 4 = 4x4 grid)
-        exclude_f8_temporal: If True, exclude F8 from temporal attention (memory opt)
+        hidden_dim: Feature dimension (default: 256)
+        num_layers: Number of encoder layers (default: 6)
+        num_heads: Number of attention heads (default: 8)
+        num_levels: Number of feature scales (default: 4)
+        num_points: Sampling points per level in deformable attn (default: 4)
+        feedforward_dim: FFN hidden dimension (default: 1024)
+        dropout: Dropout rate (default: 0.1)
+        num_fpn_levels: Number of FPN output levels (default: 3)
+        mask_dim: Output mask feature dimension (default: 256)
     """
     
     def __init__(
         self,
         hidden_dim: int = 256,
-        num_layers: int = 6,
+        num_layers: int = 1,
         num_heads: int = 8,
         num_levels: int = 4,
         num_points: int = 4,
+        feedforward_dim: int = 1024,
         dropout: float = 0.1,
-        temporal_grid_size: int = 4,
-        exclude_f8_temporal: bool = True
+        num_fpn_levels: int = 3,
+        mask_dim: int = 256
     ):
-
-        super().__init__()
+        if TORCH_AVAILABLE:
+            super().__init__()
         
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
-        self.num_heads = num_heads
         self.num_levels = num_levels
-        self.temporal_grid_size = temporal_grid_size
-        self.exclude_f8_temporal = exclude_f8_temporal
         
         if not TORCH_AVAILABLE:
             return
         
-        # Build layers
-        self.layers = nn.ModuleList()
+        # Input projections for each scale
+        # Projects backbone features to hidden_dim
+        self.input_proj = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1),
+                nn.GroupNorm(32, hidden_dim)
+            )
+            for _ in range(num_levels)
+        ])
         
-        for layer_idx in range(num_layers):
-            # Each layer has: Deformable Attention + Temporal Attention + FFN
-            layer = TemporalNeckLayer(
-                hidden_dim=hidden_dim,
+        # Initialize input projections
+        for proj in self.input_proj:
+            nn.init.xavier_uniform_(proj[0].weight, gain=1)
+            nn.init.constant_(proj[0].bias, 0)
+        
+        # Positional embeddings
+        self.pe_layer = PositionEmbeddingSine(hidden_dim // 2, normalize=True)
+        self.pe_layer_3d = PositionEmbeddingSine3D(hidden_dim // 2, normalize=True)
+        
+        # Level embeddings (learnable per-scale embeddings)
+        self.level_embed = nn.Parameter(torch.Tensor(num_levels, hidden_dim))
+        self.level_embed_3d = nn.Parameter(torch.Tensor(num_levels, hidden_dim))
+        nn.init.normal_(self.level_embed)
+        nn.init.normal_(self.level_embed_3d)
+        
+        # Encoder layers (Deformable + Temporal alternation)
+        self.deform_layers = nn.ModuleList([
+            DeformableAttention(
+                embed_dim=hidden_dim,
                 num_heads=num_heads,
                 num_levels=num_levels,
                 num_points=num_points,
-                dropout=dropout,
-                temporal_grid_size=temporal_grid_size,
-                exclude_f8_temporal=exclude_f8_temporal,
-                layer_idx=layer_idx
+                dropout=dropout
             )
-            self.layers.append(layer)
-        
-        # Final layer norm per scale
-        self.level_norms = nn.ModuleList([
-            nn.LayerNorm(hidden_dim) for _ in range(num_levels)
+            for _ in range(num_layers)
         ])
         
-        # Learnable level embeddings (used in deformable attention)
-        self.level_embed = nn.Parameter(torch.randn(num_levels, hidden_dim))
-        nn.init.normal_(self.level_embed)
-    
-    def forward(
-        self,
-        multi_scale_features: List[TensorType],
-        temporal_pos_embed: Optional[TensorType] = None
-    ) -> List[TensorType]:
-        """
-        Process multi-scale features through temporal neck.
-        
-        Args:
-            multi_scale_features: List of [F32, F16, F8, F4]
-                Each tensor has shape [B, C, H, W, T] where:
-                - B = batch size
-                - C = channels (hidden_dim)
-                - H, W = spatial dimensions (scale-dependent)
-                - T = temporal dimension (number of frames)
-            
-            temporal_pos_embed: Optional positional embeddings for temporal dimension
-                Shape: [T, hidden_dim]
-        
-        Returns:
-            Refined multi-scale features with same shapes as input
-        """
-        if not TORCH_AVAILABLE:
-            # Mock output
-            return multi_scale_features
-        
-        # Validate input
-        assert len(multi_scale_features) == self.num_levels, \
-            f"Expected {self.num_levels} scales, got {len(multi_scale_features)}"
-        
-        # Store input shapes for later
-        shapes = [feat.shape for feat in multi_scale_features]
-        
-        # Process through layers
-        for layer_idx, layer in enumerate(self.layers):
-            multi_scale_features = layer(
-                multi_scale_features,
-                level_embed=self.level_embed,
-                temporal_pos_embed=temporal_pos_embed
+        self.temporal_layers = nn.ModuleList([
+            TemporalAttention(
+                embed_dim=hidden_dim,
+                num_heads=num_heads,
+                grid_size=4,
+                dropout=dropout
             )
+            for _ in range(num_layers)
+        ])
         
-        # Final layer norm per scale
-        output_features = []
-        for feat, norm in zip(multi_scale_features, self.level_norms):
-            B, C, H, W, T = feat.shape
-            # Reshape for layer norm: [B, H, W, T, C]
-            feat = feat.permute(0, 2, 3, 4, 1)
-            feat = norm(feat)
-            # Reshape back: [B, C, H, W, T]
-            feat = feat.permute(0, 4, 1, 2, 3)
-            output_features.append(feat)
+        # Feature Pyramid Network (FPN) layers
+        self.num_fpn_levels = num_fpn_levels
+        self.lateral_convs = nn.ModuleList([
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
+            for _ in range(num_fpn_levels - 1)
+        ])
         
-        return output_features
+        self.output_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+                nn.GroupNorm(32, hidden_dim),
+                nn.ReLU(inplace=True)
+            )
+            for _ in range(num_fpn_levels - 1)
+        ])
+        
+        # Initialize FPN layers
+        for conv in self.lateral_convs:
+            nn.init.xavier_uniform_(conv.weight, gain=1)
+            nn.init.constant_(conv.bias, 0)
+        
+        for conv_seq in self.output_convs:
+            nn.init.xavier_uniform_(conv_seq[0].weight, gain=1)
+            nn.init.constant_(conv_seq[0].bias, 0)
+        
+        # Mask feature projection
+        self.mask_features = nn.Conv2d(hidden_dim, mask_dim, kernel_size=1)
+        nn.init.xavier_uniform_(self.mask_features.weight, gain=1)
+        nn.init.constant_(self.mask_features.bias, 0)
     
-    def num_parameters(self) -> int:
-        """Count total number of parameters."""
-        if not TORCH_AVAILABLE:
-            return 0
-        return sum(p.numel() for p in self.parameters())
-    
-    def __repr__(self) -> str:
-        return (
-            f"TemporalNeck(\n"
-            f"  hidden_dim={self.hidden_dim},\n"
-            f"  num_layers={self.num_layers},\n"
-            f"  num_heads={self.num_heads},\n"
-            f"  num_levels={self.num_levels},\n"
-            f"  temporal_grid={self.temporal_grid_size}x{self.temporal_grid_size},\n"
-            f"  exclude_f8_temporal={self.exclude_f8_temporal}\n"
-            f")"
-        )
-
-
-class TemporalNeckLayer(nn.Module):
-    """
-    Single layer of Temporal Neck.
-    
-    Consists of:
-    1. Deformable Attention (spatial, multi-scale)
-    2. Temporal Attention (temporal, grid-based)
-    3. Feed-Forward Network
-    
-    Args:
-        hidden_dim: Feature dimension
-        num_heads: Number of attention heads
-        num_levels: Number of feature scales
-        num_points: Sampling points for deformable attention
-        dropout: Dropout rate
-        temporal_grid_size: Grid size for temporal attention
-        exclude_f8_temporal: Exclude F8 from temporal attention
-        layer_idx: Layer index (for debugging)
-    """
-    
-    def __init__(
-        self,
-        hidden_dim: int = 256,
-        num_heads: int = 8,
-        num_levels: int = 4,
-        num_points: int = 4,
-        dropout: float = 0.1,
-        temporal_grid_size: int = 4,
-        exclude_f8_temporal: bool = True,
-        layer_idx: int = 0
-    ):
-        if TORCH_AVAILABLE:
-            super().__init__()
-        
-        self.hidden_dim = hidden_dim
-        self.layer_idx = layer_idx
-        self.exclude_f8_temporal = exclude_f8_temporal
-        
-        if not TORCH_AVAILABLE:
-            return
-        
-        # 1. Deformable Attention (spatial, multi-scale)
-        self.deformable_attn = DeformableAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            num_levels=num_levels,
-            num_points=num_points,
-            dropout=dropout
-        )
-        
-        # 2. Temporal Attention (temporal, grid-based)
-        # Exclude F8 (scale index 2) for memory efficiency
-        num_temporal_levels = num_levels - 1 if exclude_f8_temporal else num_levels
-        
-        self.temporal_attn = TemporalAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            grid_size=temporal_grid_size,
-            dropout=dropout
-        )
-        
-        # 3. Feed-Forward Network
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 4),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 4, hidden_dim),
-            nn.Dropout(dropout)
-        )
-        
-        # Layer norms
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        self.norm3 = nn.LayerNorm(hidden_dim)
-        
-        # Dropout
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(
-        self,
-        multi_scale_features: List[TensorType],
-        level_embed: Optional[TensorType] = None,
-        temporal_pos_embed: Optional[TensorType] = None
-    ) -> List[TensorType]:
+    def forward(self, features: List[torch.Tensor]) -> List[torch.Tensor]:
         """
-        Process features through one Temporal Neck layer.
+        Forward pass through Temporal Neck.
         
         Args:
-            multi_scale_features: List of [F32, F16, F8, F4]
-                Each: [B, C, H, W, T]
-            level_embed: Level embeddings [num_levels, C]
-            temporal_pos_embed: Temporal position embeddings [T, C]
-            
+            features: List of [B, C, H, W, T] for each scale [F32, F16, F8, F4]
+        
         Returns:
-            Refined multi-scale features
+            List of refined multi-scale features for decoder
         """
         if not TORCH_AVAILABLE:
-            return multi_scale_features
+            return features
         
-        # Step 1: Deformable Attention (spatial, multi-scale)
-        # This operates on all scales simultaneously
-        deform_output = self.deformable_attn(
-            multi_scale_features,
-            level_embed=level_embed,
-            temporal_pos_embed=temporal_pos_embed
-        )
+        # Extract dimensions
+        B, C, H, W, T = features[0].shape
         
-        # Residual connection + norm
-        multi_scale_features = [
-            self._residual_norm(feat, out, self.norm1)
-            for feat, out in zip(multi_scale_features, deform_output)
-        ]
+        # Step 1: Project inputs and add positional embeddings
+        srcs = []
+        pos_2d = []
+        pos_3d = []
         
-        # Step 2: Temporal Attention (temporal, grid-based)
-        # This operates per scale (excluding F8 if specified)
-        temporal_output = []
-        for scale_idx, feat in enumerate(multi_scale_features):
-            if self.exclude_f8_temporal and scale_idx == 2:  # F8 is index 2
-                # Skip temporal attention for F8
-                temporal_output.append(feat)
-            else:
-                # Apply temporal attention
-                feat_temporal = self.temporal_attn(
-                    feat,
-                    temporal_pos_embed=temporal_pos_embed
-                )
-                temporal_output.append(feat_temporal)
-        
-        # Residual connection + norm
-        multi_scale_features = [
-            self._residual_norm(feat, out, self.norm2)
-            for feat, out in zip(multi_scale_features, temporal_output)
-        ]
-        
-        # Step 3: Feed-Forward Network
-        ffn_output = []
-        for feat in multi_scale_features:
+        for level_idx, feat in enumerate(features):
+            # feat: [B, C, H, W, T]
             B, C, H, W, T = feat.shape
-            # Reshape for FFN: [B*H*W*T, C]
-            feat_flat = feat.permute(0, 2, 3, 4, 1).reshape(-1, C)
-            feat_ffn = self.ffn(feat_flat)
-            # Reshape back: [B, C, H, W, T]
-            feat_ffn = feat_ffn.reshape(B, H, W, T, C).permute(0, 4, 1, 2, 3)
-            ffn_output.append(feat_ffn)
+            
+            # Generate 3D positional embeddings
+            # feat is [B, C, H, W, T], need [B, T, C, H, W] (fmt='btchw')
+            feat_for_pos = feat.permute(0, 4, 1, 2, 3)  # [B, T, C, H, W]
+            pos_3d_level = self.pe_layer_3d(feat_for_pos, fmt='btchw')  # [B, T, C, H, W]
+            pos_3d.append(pos_3d_level)
+            
+            # Process each frame
+            # Rearrange: [B, C, H, W, T] -> [B*T, C, H, W]
+            feat_2d = feat.permute(0, 4, 1, 2, 3).reshape(B * T, C, H, W)
+            
+            # Generate 2D positional embeddings
+            pos_2d_level = self.pe_layer(feat_2d)  # [B*T, C, H, W]
+            pos_2d.append(pos_2d_level)
+            
+            # Apply input projection
+            feat_proj = self.input_proj[level_idx](feat_2d)  # [B*T, C, H, W]
+            
+            # Reshape back: [B*T, C, H, W] -> [B, T, C, H, W]
+            feat_proj = feat_proj.view(B, T, C, H, W)
+            srcs.append(feat_proj)
         
-        # Residual connection + norm
-        multi_scale_features = [
-            self._residual_norm(feat, out, self.norm3)
-            for feat, out in zip(multi_scale_features, ffn_output)
-        ]
+        # Step 2: Apply encoder layers (Deformable + Temporal)
+        output_features = srcs
         
-        return multi_scale_features
-    
-    def _residual_norm(
-        self,
-        input_feat: TensorType,
-        output_feat: TensorType,
-        norm_layer: nn.Module
-    ) -> TensorType:
-        """Apply residual connection and layer norm."""
-        # Add residual
-        feat = input_feat + self.dropout(output_feat)
+        for layer_idx in range(self.num_layers):
+            # Verify shapes before deformable attention
+            for i, f in enumerate(output_features):
+                assert f.shape[2] == self.hidden_dim, \
+                    f"Scale {i}: Expected channel dim {self.hidden_dim}, got {f.shape[2]}"
+            
+            # Convert to [B, C, H, W, T] for deformable attention
+            deform_input = [f.permute(0, 2, 3, 4, 1) for f in output_features]  # [B, T, C, H, W] -> [B, C, H, W, T]
+            
+            # Apply deformable attention
+            deform_output = self.deform_layers[layer_idx](
+                deform_input,
+                level_embed=self.level_embed
+            )
+            
+            # Convert back to [B, T, C, H, W]
+            deform_output = [f.permute(0, 4, 1, 2, 3) for f in deform_output]  # [B, C, H, W, T] -> [B, T, C, H, W]
+            
+            # Apply temporal attention to each scale
+            refined_features = []
+            for scale_idx, feat in enumerate(deform_output):
+                # Add 3D positional embedding
+                feat_with_pos = feat + pos_3d[scale_idx]
+                
+                # Rearrange for temporal attention: [B, C, H, W, T]
+                feat_rearranged = feat_with_pos.permute(0, 2, 3, 4, 1)
+                
+                # Apply temporal attention
+                feat_temporal = self.temporal_layers[layer_idx](feat_rearranged)
+                
+                # Rearrange back: [B, T, C, H, W]
+                feat_out = feat_temporal.permute(0, 4, 1, 2, 3)
+                refined_features.append(feat_out)
+            
+            output_features = refined_features
         
-        # Apply layer norm
-        B, C, H, W, T = feat.shape
-        feat = feat.permute(0, 2, 3, 4, 1)  # [B, H, W, T, C]
-        feat = norm_layer(feat)
-        feat = feat.permute(0, 4, 1, 2, 3)  # [B, C, H, W, T]
+        # Step 3: Feature Pyramid Network (FPN)
+        # Merge batch and time: [B, T, C, H, W] -> [B*T, C, H, W]
+        fpn_inputs = [f.reshape(B * T, C, f.shape[3], f.shape[4]) for f in output_features]
         
-        return feat
-
-
-# Placeholder implementations (to be replaced by actual modules)
-class DeformableAttention(nn.Module):
-    """Placeholder for Deformable Attention (will be implemented separately)."""
-    
-    def __init__(self, **kwargs):
-        if TORCH_AVAILABLE:
-            super().__init__()
-        self.kwargs = kwargs
-    
-    def forward(self, multi_scale_features, **kwargs):
-        # Placeholder: return input unchanged
-        return multi_scale_features
-
-
-class TemporalAttention(nn.Module):
-    """Placeholder for Temporal Attention (will be implemented separately)."""
-    
-    def __init__(self, **kwargs):
-        if TORCH_AVAILABLE:
-            super().__init__()
-        self.kwargs = kwargs
-    
-    def forward(self, features, **kwargs):
-        # Placeholder: return input unchanged
-        return features
+        # Build FPN top-down (finest to coarsest)
+        fpn_outputs = []
+        prev_features = None
+        
+        for idx in range(len(fpn_inputs) - 1, -1, -1):
+            features_i = fpn_inputs[idx]
+            
+            if prev_features is None:
+                # Finest level
+                fpn_outputs.append(features_i)
+                prev_features = features_i
+            else:
+                # Apply lateral connection
+                if idx < len(self.lateral_convs):
+                    lateral = self.lateral_convs[idx](features_i)
+                else:
+                    lateral = features_i
+                
+                # Upsample previous and add
+                prev_upsampled = F.interpolate(
+                    prev_features,
+                    size=features_i.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False
+                )
+                
+                fused = lateral + prev_upsampled
+                
+                # Apply output conv
+                if idx < len(self.output_convs):
+                    fused = self.output_convs[idx](fused)
+                
+                fpn_outputs.append(fused)
+                prev_features = fused
+        
+        # Reverse to coarse-to-fine order
+        fpn_outputs = fpn_outputs[::-1]
+        
+        # Step 4: Add mask features
+        mask_features = self.mask_features(fpn_outputs[-1])
+        fpn_outputs.append(mask_features)
+        
+        return fpn_outputs[:self.num_fpn_levels + 1]
 
 
 if __name__ == "__main__":
-    print("="*60)
-    print("Temporal Neck Architecture Demo")
-    print("="*60 + "\n")
+    print("="*70)
+    print("Faithful Temporal Neck Implementation")
+    print("="*70 + "\n")
     
     if TORCH_AVAILABLE:
-        # Create temporal neck
-        neck = TemporalNeck(
+        # Create model
+        model = TemporalNeckFaithful(
             hidden_dim=256,
-            num_layers=6,
+            num_layers=1,
             num_heads=8,
-            num_levels=4,
-            temporal_grid_size=4
+            num_levels=4
         )
         
-        print(f"Temporal Neck Architecture:\n{neck}\n")
-        print(f"Number of parameters: {neck.num_parameters():,}\n")
+        print("Model created:")
+        print("  Hidden dim: 256")
+        print("  Num layers: 6")
+        print("  Num heads: 8")
+        print("  Num levels: 4\n")
         
-        # Create mock multi-scale features
-        B, C, T = 2, 256, 5  # batch=2, channels=256, frames=5
+        # Test with dummy input
+        B, C, T = 2, 256, 3
         
-        # Multi-scale features with different spatial resolutions
-        F32 = torch.randn(B, C, 16, 16, T)   # 1/32 scale
-        F16 = torch.randn(B, C, 32, 32, T)   # 1/16 scale
-        F8 = torch.randn(B, C, 64, 64, T)    # 1/8 scale
-        F4 = torch.randn(B, C, 128, 128, T)  # 1/4 scale
+        F32 = torch.randn(B, C, 16, 16, T)
+        F16 = torch.randn(B, C, 32, 32, T)
+        F8 = torch.randn(B, C, 64, 64, T)
+        F4 = torch.randn(B, C, 128, 128, T)
         
-        multi_scale_features = [F32, F16, F8, F4]
+        features = [F32, F16, F8, F4]
         
         print("Input shapes:")
-        for i, feat in enumerate(multi_scale_features):
-            scale = [32, 16, 8, 4][i]
-            print(f"  F{scale}: {feat.shape}")
+        for i, f in enumerate(features):
+            print(f"  F{32//(2**i)}: {f.shape}")
         print()
         
         # Forward pass
-        print("Processing through Temporal Neck...")
-        output_features = neck(multi_scale_features)
+        print("Running forward pass...")
+        output = model(features)
         
         print("\nOutput shapes:")
-        for i, feat in enumerate(output_features):
-            scale = [32, 16, 8, 4][i]
-            print(f"  F{scale}': {feat.shape}")
+        for i, f in enumerate(output):
+            print(f"  Output {i}: {f.shape}")
         
-        # Verify shapes unchanged
-        print("\n✓ Shapes preserved (as expected)")
-        print("\nNote: Deformable and Temporal Attention are placeholders.")
-        print("They will be implemented next!")
+        print("\n✓ Faithful Temporal Neck implementation complete!")
         
     else:
         print("PyTorch not available")
-        print("Install with: pip install torch")

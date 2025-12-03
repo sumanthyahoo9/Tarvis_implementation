@@ -20,24 +20,16 @@ In the full TarViS, this uses custom CUDA kernels for efficiency.
 Here we provide a PyTorch-native implementation for understanding/testing.
 """
 
-from typing import List, Optional, Tuple, Any, Union
+from typing import List, Optional
 import math
-
-try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    TORCH_AVAILABLE = True
-    TensorType = torch.Tensor
-except ImportError:
-    TORCH_AVAILABLE = False
-    torch = None
-    nn = None
-    F = None
-    TensorType = Any
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+TORCH_AVAILABLE = True
+TensorType = torch.Tensor
 
 
-class DeformableAttention(nn.Module if TORCH_AVAILABLE else object):
+class DeformableAttention(nn.Module):
     """
     Multi-scale Deformable Attention.
     
@@ -251,24 +243,32 @@ class DeformableAttention(nn.Module if TORCH_AVAILABLE else object):
             multi_scale_features,
             reference_points,
             sampling_offsets
-        )  # [B, H*W, num_heads, num_levels*num_points, head_dim]
+        )  # [B, N, num_heads, num_levels*num_points, head_dim]
         
-        # Aggregate with attention weights
-        # Reshape for weighted sum
+        # sampled_features has shape [B, N, num_heads, L*K, head_dim]
+        # We need to reshape to [B, N, num_heads, L, K, head_dim] for weighting
+        B, N, M, LK, head_dim = sampled_features.shape
         sampled_features = sampled_features.view(
-            B, H * W, self.num_heads, self.num_levels, self.num_points, self.head_dim
+            B, N, M, self.num_levels, self.num_points, head_dim
         )
         
-        # Weighted sum: [B, H*W, num_heads, head_dim]
-        output = (sampled_features * attention_weights.unsqueeze(-1)).sum(dim=[3, 4])
+        # Aggregate with attention weights
+        # attention_weights: [B, N, num_heads, num_levels, num_points]
+        # Expand last dim for broadcasting: [B, N, M, L, K, 1]
+        attn_weights_expanded = attention_weights.unsqueeze(-1)
         
-        # Concatenate heads and project
-        output = output.flatten(-2)  # [B, H*W, C]
-        output = self.output_proj(output)
+        # Weighted sum over levels and points: [B, N, M, head_dim]
+        output = (sampled_features * attn_weights_expanded).sum(dim=[3, 4])
+        
+        # Flatten heads: [B, N, M*head_dim] = [B, N, embed_dim]
+        output = output.reshape(B, N, self.embed_dim)
+        
+        # Project (identity since already embed_dim)
+        output = self.output_proj(output)  # [B, N, embed_dim]
         output = self.dropout(output)
         
         # Reshape back to [B, C, H, W]
-        output = output.permute(0, 2, 1).view(B, C, H, W)
+        output = output.permute(0, 2, 1).view(B, self.embed_dim, H, W)
         
         return output
     
@@ -309,100 +309,96 @@ class DeformableAttention(nn.Module if TORCH_AVAILABLE else object):
         """
         Sample features at offset locations using bilinear interpolation.
         
+        This is the core of deformable attention:
+        1. For each query point, predict K sampling offsets per level
+        2. Sample features at those offset locations (bilinear interpolation)
+        3. Return sampled features for aggregation with attention weights
+        
         Args:
-            multi_scale_features: List of [B, C, H_l, W_l]
-            reference_points: [H*W, 2] normalized coordinates
-            sampling_offsets: [B, H*W, num_heads, num_levels, num_points, 2]
+            multi_scale_features: List of [B, C, H_l, W_l] for each level
+            reference_points: [N, 2] normalized coordinates (one per query)
+            sampling_offsets: [B, N, num_heads, num_levels, num_points, 2]
             
         Returns:
-            Sampled features: [B, H*W, num_heads, num_levels*num_points, head_dim]
+            Sampled features: [B, N, num_heads, num_levels*num_points, C]
         """
-        B, _, _, _ = multi_scale_features[0].shape
-        N = reference_points.shape[0]  # H*W
+        B = multi_scale_features[0].shape[0]
+        C = self.embed_dim
+        N = reference_points.shape[0]
         
-        # Project value features for all scales
-        value_features = []
-        for feat in multi_scale_features:
+        # Collect sampled features from all levels
+        all_sampled = []
+        
+        for level_idx, feat in enumerate(multi_scale_features):
             # feat: [B, C, H_l, W_l]
-            val = self.value_proj(feat.flatten(2).permute(0, 2, 1))
-            # Reshape to multi-head: [B, H_l*W_l, num_heads, head_dim]
-            val = val.view(B, -1, self.num_heads, self.head_dim)
-            value_features.append(val)
-        
-        # Sample from each level
-        sampled_list = []
-        
-        for level_idx, (feat, val) in enumerate(zip(multi_scale_features, value_features)):
-            B, C, H_l, W_l = feat.shape
+            _, _, H_l, W_l = feat.shape
             
-            # Get offsets for this level: [B, H*W, num_heads, num_points, 2]
+            # Get sampling offsets for this level
+            # offsets: [B, N, num_heads, num_points, 2]
             offsets = sampling_offsets[:, :, :, level_idx, :, :]
             
-            # Expand reference points for heads and points
-            # [H*W, 2] -> [B, H*W, num_heads, num_points, 2]
-            ref_pts = reference_points.unsqueeze(0).unsqueeze(2).unsqueeze(3)
-            ref_pts = ref_pts.expand(B, N, self.num_heads, self.num_points, 2)
-            
-            # Add offsets (normalized by level size)
-            sampling_locations = ref_pts + offsets / torch.tensor(
-                [W_l, H_l], device=feat.device
+            # Reference points: [N, 2] -> [B, N, 1, 1, 2]
+            ref_pts = reference_points[None, :, None, None, :].expand(
+                B, N, self.num_heads, self.num_points, 2
             )
             
-            # Clip to valid range
-            sampling_locations = sampling_locations.clamp(0, 1)
+            # Add offsets (normalize by spatial size)
+            # Offsets are in normalized coordinates [-1, 1] range
+            sampling_locations = ref_pts + offsets / torch.tensor(
+                [W_l, H_l], dtype=torch.float32, device=feat.device
+            )
             
-            # Convert to grid_sample format: [-1, 1]
-            sampling_grid = sampling_locations * 2 - 1
+            # Clip to valid range [0, 1]
+            sampling_locations = torch.clamp(sampling_locations, 0, 1)
             
-            # Reshape for grid_sample
-            # [B, H*W*num_heads*num_points, 1, 2]
-            sampling_grid = sampling_grid.flatten(1, 3).unsqueeze(2)
+            # Convert to grid_sample format: [0, 1] -> [-1, 1]
+            grid = sampling_locations * 2.0 - 1.0
             
-            # Sample features using grid_sample
+            # Reshape for grid_sample: [B*num_heads, N*num_points, 1, 2]
+            grid = grid.permute(0, 2, 1, 3, 4)  # [B, num_heads, N, num_points, 2]
+            grid = grid.reshape(B * self.num_heads, N * self.num_points, 1, 2)
+            
+            # Project features with value projection first
             # feat: [B, C, H_l, W_l]
-            # Need to expand for each head separately
-            feat_expanded = feat.unsqueeze(1).expand(B, self.num_heads, C, H_l, W_l)
-            feat_expanded = feat_expanded.flatten(0, 1)  # [B*num_heads, C, H_l, W_l]
+            feat_flat = feat.flatten(2).permute(0, 2, 1)  # [B, H_l*W_l, C]
+            feat_value = self.value_proj(feat_flat)  # [B, H_l*W_l, C]
             
-            # Adjust sampling grid
-            # Reshape to [B*num_heads, N, num_points, 1, 2]
-            grid_per_head = sampling_grid.view(
-                B, N, self.num_heads, self.num_points, 1, 2
-            ).permute(0, 2, 1, 3, 4, 5).flatten(0, 1)  # [B*num_heads, N, num_points, 1, 2]
+            # Split into heads: [B, H_l*W_l, num_heads, head_dim]
+            feat_value = feat_value.view(B, H_l * W_l, self.num_heads, self.head_dim)
             
-            # Flatten spatial dimensions for grid_sample
-            # grid_sample expects [N, H_out, W_out, 2], so flatten to [N*num_points, 1, 2]
-            grid_flat = grid_per_head.view(B * self.num_heads, N * self.num_points, 1, 2)
+            # Rearrange for grid_sample: [B*num_heads, head_dim, H_l, W_l]
+            feat_value = feat_value.permute(0, 2, 3, 1)  # [B, num_heads, head_dim, H_l*W_l]
+            feat_value = feat_value.reshape(B * self.num_heads, self.head_dim, H_l, W_l)
             
-            # Sample
-            sampled = F.grid_sample(
-                feat_expanded,
-                grid_flat,
+            # Sample using bilinear interpolation
+            # grid_sample input: [B*num_heads, head_dim, H_l, W_l]
+            # grid_sample grid: [B*num_heads, N*num_points, 1, 2]
+            # output: [B*num_heads, head_dim, N*num_points, 1]
+            sampled = torch.nn.functional.grid_sample(
+                feat_value,
+                grid,
                 mode='bilinear',
                 padding_mode='zeros',
                 align_corners=False
-            )  # [B*num_heads, C, N*num_points, 1]
-            
-            # Remove last dimension and reshape
-            sampled = sampled.squeeze(-1)  # [B*num_heads, C, N*num_points]
-            
-            # Reshape: [B, num_heads, C, N, num_points]
-            sampled = sampled.view(
-                B, self.num_heads, C, N, self.num_points
             )
             
-            # Rearrange: [B, N, num_heads, num_points, C]
-            sampled = sampled.permute(0, 3, 1, 4, 2)
+            # Remove extra dimension: [B*num_heads, head_dim, N*num_points]
+            sampled = sampled.squeeze(-1)
             
-            # Split into heads: [B, N, num_heads, num_points, head_dim]
-            # Note: C might not equal embed_dim if using value projection
-            # For now, use actual C dimension
-            sampled_list.append(sampled)
+            # Reshape: [B, num_heads, head_dim, N*num_points]
+            sampled = sampled.reshape(B, self.num_heads, self.head_dim, N * self.num_points)
+            
+            # Rearrange: [B, N, num_heads, num_points, head_dim]
+            sampled = sampled.reshape(B, self.num_heads, self.head_dim, N, self.num_points)
+            sampled = sampled.permute(0, 3, 1, 4, 2)  # [B, N, num_heads, num_points, head_dim]
+            
+            all_sampled.append(sampled)
         
-        # Concatenate all levels: [B, N, num_heads, num_levels*num_points, C]
-        # Stack along level dimension then reshape
-        output = torch.stack(sampled_list, dim=3)  # [B, N, num_heads, num_levels, num_points, C]
-        output = output.flatten(3, 4)  # [B, N, num_heads, num_levels*num_points, C]
+        # Stack all levels: [B, N, num_heads, num_levels, num_points, head_dim]
+        output = torch.stack(all_sampled, dim=3)
+        
+        # Flatten levels and points: [B, N, num_heads, num_levels*num_points, head_dim]
+        output = output.reshape(B, N, self.num_heads, -1, self.head_dim)
         
         return output
 
@@ -421,7 +417,7 @@ if __name__ == "__main__":
             num_points=4
         )
         
-        print(f"Deformable Attention:")
+        print("Deformable Attention:")
         print(f"  Embed dim: {deform_attn.embed_dim}")
         print(f"  Num heads: {deform_attn.num_heads}")
         print(f"  Num levels: {deform_attn.num_levels}")
