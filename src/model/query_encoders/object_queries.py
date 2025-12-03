@@ -14,8 +14,7 @@ Key difference from HODOR: Uses hard-masked attention with pmax points per objec
 instead of soft-masked attention over entire image.
 """
 
-from typing import Dict, List, Optional, Tuple, Any, Union
-from pathlib import Path
+from typing import Dict, Optional, Tuple, Union
 import math
 import torch
 import torch.nn as nn
@@ -421,6 +420,8 @@ class ObjectEncoderLayer(nn.Module):
             cross_attn_mask = cross_attn_mask.unsqueeze(1).expand(B, N, O * P)
             # Convert to boolean (True = ignore)
             cross_attn_mask = ~cross_attn_mask.bool()
+            # Repeat for num_heads: [B*num_heads, N, O*P]
+            cross_attn_mask = cross_attn_mask.repeat_interleave(self.cross_attn.num_heads, dim=0)
         else:
             cross_attn_mask = None
         

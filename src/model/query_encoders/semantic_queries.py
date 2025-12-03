@@ -11,8 +11,7 @@ These queries are learned embeddings that serve as abstract representations of
 segmentation targets, making the architecture task-agnostic.
 """
 
-from typing import Dict, List, Optional, Tuple, Any, Union
-from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 TORCH_AVAILABLE = True
