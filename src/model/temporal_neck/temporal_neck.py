@@ -97,8 +97,7 @@ class PositionEmbeddingSine3D(nn.Module):
     """
     
     def __init__(self, num_pos_feats=64, temperature=10000, normalize=False, scale=None):
-        if TORCH_AVAILABLE:
-            super().__init__()
+        super().__init__()
         self.num_pos_feats = num_pos_feats
         self.temperature = temperature
         self.normalize = normalize
@@ -208,8 +207,7 @@ class TemporalNeckFaithful(nn.Module):
         num_fpn_levels: int = 3,
         mask_dim: int = 256
     ):
-        if TORCH_AVAILABLE:
-            super().__init__()
+        super().__init__()
         
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers

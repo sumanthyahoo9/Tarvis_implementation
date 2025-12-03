@@ -1,26 +1,28 @@
 """
-Integration Test: Temporal Neck with DAVIS Dataset
+Integration Test: Temporal Neck with YouTube-VIS Dataset
 
 Tests the complete flow:
-1. Load DAVIS video frames (multiple frames)
+1. Load YouTube-VIS video frames (multiple frames)
 2. Extract multi-scale features with ResNet-50
 3. Apply Temporal Neck (Deformable + Temporal Attention)
-4. Verify output shapes and temporal consistency
+4. Verify output shapes and feature quality
 
-This is downstream of encoder tests - we're now testing the temporal
-fusion component that makes features consistent across video frames.
+This tests the temporal fusion on YouTube-VIS data (VIS task).
 """
 
 import sys
-import traceback
 from pathlib import Path
+import json
+import traceback
+import numpy as np
 from PIL import Image
 import torch
 import torchvision.models as models
 import torchvision.transforms as T
 from src.model.temporal_neck.temporal_neck import TemporalNeckFaithful
-TORCH_AVAILABLE = True
 sys.path.insert(0, str(Path(__file__).parent.parent))
+TORCH_AVAILABLE = True
+
 
 class ResNet50FeatureExtractor:
     """Extract multi-scale features from ResNet-50."""
@@ -101,19 +103,58 @@ class ResNet50FeatureExtractor:
         }
 
 
-def load_davis_frames(dataset_path, video_name="bear", num_frames=5, start_idx=0):
-    """Load multiple frames from DAVIS video."""
+def load_ytvis_frames(dataset_path, video_id=None, num_frames=5):
+    """
+    Load frames from YouTube-VIS video.
+    
+    Args:
+        dataset_path: Path to YouTube-VIS root
+        video_id: Video ID (if None, uses first video)
+        num_frames: Number of frames to load
+        
+    Returns:
+        frames: [1, T, 3, H, W]
+        video_info: Dict with video metadata
+    """
     dataset_path = Path(dataset_path)
     
+    # Load annotations
+    annotations_file = dataset_path / "train.json"
+    if not annotations_file.exists():
+        raise FileNotFoundError(f"Annotations not found: {annotations_file}")
+    
+    with open(annotations_file, 'r') as f:
+        data = json.load(f)
+    
+    # Get first video if not specified
+    if video_id is None:
+        video = data['videos'][0]
+        video_id = video['id']
+    else:
+        video = next(v for v in data['videos'] if v['id'] == video_id)
+    
+    print(f"Video: {video['id']}")
+    print(f"  Length: {video['length']} frames")
+    print(f"  Resolution: {video['width']}x{video['height']}")
+    
+    # Load frames
+    video_dir = dataset_path / "train" / "JPEGImages" / video['file_names'][0].split('/')[0]
+    
     frames = []
-    for i in range(start_idx, start_idx + num_frames):
-        img_path = dataset_path / "JPEGImages" / "480p" / video_name / f"{i:05d}.jpg"
+    frame_indices = np.linspace(0, min(num_frames, video['length']) - 1, num_frames, dtype=int)
+    
+    for idx in frame_indices:
+        frame_name = video['file_names'][idx]
+        frame_path = dataset_path / "train" / "JPEGImages" / frame_name
         
-        if not img_path.exists():
-            print(f"⚠ Frame {i} not found, stopping at {len(frames)} frames")
-            break
+        if not frame_path.exists():
+            print(f"⚠ Frame not found: {frame_path}")
+            continue
         
-        img = Image.open(img_path).convert('RGB')
+        img = Image.open(frame_path).convert('RGB')
+        
+        # Resize to standard size for efficiency
+        img = img.resize((720, 480))  # Smaller for CPU testing
         
         # ImageNet normalization
         transform = T.Compose([
@@ -124,7 +165,7 @@ def load_davis_frames(dataset_path, video_name="bear", num_frames=5, start_idx=0
         frames.append(img_tensor)
     
     if len(frames) == 0:
-        raise FileNotFoundError(f"No frames found for video {video_name}")
+        raise FileNotFoundError(f"No frames found for video {video_id}")
     
     # Stack: [T, 3, H, W]
     frames = torch.stack(frames, dim=0)
@@ -132,33 +173,36 @@ def load_davis_frames(dataset_path, video_name="bear", num_frames=5, start_idx=0
     # Add batch dim: [1, T, 3, H, W]
     frames = frames.unsqueeze(0)
     
-    return frames
+    return frames, video
 
 
-def test_temporal_neck_with_davis():
-    """Test temporal neck with real DAVIS video."""
+def test_temporal_neck_with_ytvis():
+    """Test temporal neck with real YouTube-VIS video."""
     print("="*70)
-    print("Testing Temporal Neck with DAVIS Video")
+    print("Testing Faithful Temporal Neck with YouTube-VIS Video")
     print("="*70 + "\n")
     
-    dataset_path = "/Volumes/Elements/datasets/DAVIS"
+    dataset_path = "/Volumes/Elements/datasets/youtube_vis_2021"
     device = 'cpu'
     
     # Step 1: Load video frames
-    print("Step 1: Loading DAVIS video frames...")
-    video_name = "bear"
+    print("Step 1: Loading YouTube-VIS video frames...")
     num_frames = 5
     
-    frames = load_davis_frames(dataset_path, video_name, num_frames)
+    try:
+        frames, video_info = load_ytvis_frames(dataset_path, video_id=None, num_frames=num_frames)
+    except FileNotFoundError as e:
+        print(f"✗ Error: {e}")
+        return False
+    
     B, T, C, H, W = frames.shape
     
-    print(f"✓ Video: {video_name}")
-    print(f"✓ Frames: {T}")
+    print(f"✓ Loaded {T} frames")
     print(f"✓ Shape: [B={B}, T={T}, C={C}, H={H}, W={W}]\n")
     
     # Step 2: Extract multi-scale features
     print("Step 2: Extracting multi-scale features with ResNet-50...")
-    print("  (This will take ~30 seconds on CPU...)")
+    print("  (This will take ~30-60 seconds on CPU...)")
     
     feature_extractor = ResNet50FeatureExtractor(device)
     frames = frames.to(device)
@@ -186,27 +230,25 @@ def test_temporal_neck_with_davis():
     ).to(device)
     
     print("✓ Faithful Temporal Neck created")
-    print("  Layers: 6")
-    print("  Heads: 8")
-    print("  Levels: 4")
-    print("  FPN levels: 3")
+    print("  Architecture: 6 layers")
     print("  Components:")
     print("    • Input projections (Conv2d + GroupNorm)")
-    print("    • 2D & 3D positional embeddings")
-    print("    • Level embeddings")
-    print("    • Deformable attention")
-    print("    • Temporal attention")
+    print("    • 2D & 3D positional embeddings (sinusoidal)")
+    print("    • Level embeddings (learnable)")
+    print("    • Deformable attention (multi-scale sampling)")
+    print("    • Temporal attention (grid-based)")
     print("    • Feature Pyramid Network (FPN)")
     print("    • Mask feature projection\n")
     
     # Step 4: Apply temporal neck
     print("Step 4: Applying Faithful Temporal Neck...")
-    print("  (This will take ~1-2 minutes on CPU...)")
-    print("  Processing:")
+    print("  ⚠ WARNING: This will take 5-10 minutes on CPU!")
+    print("  Processing pipeline:")
     print("    1. Input projections + positional embeddings")
-    print("    2. 6 layers of Deformable + Temporal Attention")
+    print("    2. 6 layers × (Deformable + Temporal Attention)")
     print("    3. Feature Pyramid Network (FPN)")
-    print("    4. Mask feature projection\n")
+    print("    4. Mask feature projection")
+    print("\n  Please be patient...\n")
     
     # Convert to list for temporal neck
     feature_list = [features['F32'], features['F16'], features['F8'], features['F4']]
@@ -229,7 +271,7 @@ def test_temporal_neck_with_davis():
     
     print("\n✓ Outputs verified!")
     print("  Note: Output format is [B*T, C, H, W] (batch and time merged)")
-    print("        This is the expected format for Mask2Former decoder\n")
+    print("        This is ready for Mask2Former decoder\n")
     
     # Step 6: Check feature quality
     print("Step 6: Analyzing output features...")
@@ -258,11 +300,11 @@ def test_temporal_neck_with_davis():
     print("Step 7: Summary...")
     
     print("\n" + "="*70)
-    print("✓ SUCCESS! Faithful Temporal Neck works with DAVIS video!")
+    print("✓ SUCCESS! Faithful Temporal Neck works with YouTube-VIS!")
     print("="*70)
     
     print("\nWhat happened:")
-    print("  1. Loaded 5 consecutive frames from DAVIS bear video")
+    print(f"  1. Loaded {T} frames from YouTube-VIS video")
     print("  2. Extracted multi-scale features (F32, F16, F8, F4)")
     print("  3. Applied input projections + positional embeddings")
     print("  4. Applied 6 layers of Deformable + Temporal Attention")
@@ -286,7 +328,7 @@ def test_temporal_neck_with_davis():
     print("\nNext Steps:")
     print("  → These features go to Transformer Decoder")
     print("  → Decoder refines queries with these features")
-    print("  → Final output: Segmentation masks")
+    print("  → Final output: Instance segmentation masks")
     
     return True
 
@@ -296,13 +338,14 @@ if __name__ == "__main__":
         print("PyTorch not available!")
         sys.exit(1)
     
-    dataset_path = "/Volumes/Elements/datasets/DAVIS"
+    dataset_path = "/Volumes/Elements/datasets/youtube_vis_2021"
     if not Path(dataset_path).exists():
         print(f"Dataset not found: {dataset_path}")
+        print("Please update the dataset_path in the script.")
         sys.exit(1)
     
     try:
-        success = test_temporal_neck_with_davis()
+        success = test_temporal_neck_with_ytvis()
         if success:
             print("\n✓ All tests passed!")
         else:
