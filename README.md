@@ -1,0 +1,2 @@
+## TarVIS
+### This is a native implementation of TarVIS (https://arxiv.org/abs/2301.02657) which is Target-based Video Segmentation, which combines 11 datasets to obtain a video segmentation model that can operate like a Foundation model.
