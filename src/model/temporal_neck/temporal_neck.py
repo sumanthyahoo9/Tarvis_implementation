@@ -23,8 +23,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from deformable_attention import DeformableAttention
-from temporal_attention import TemporalAttention
+from src.model.temporal_neck.deformable_attention import DeformableAttention
+from src.model.temporal_neck.temporal_attention import TemporalAttention
 TORCH_AVAILABLE = True
 
 
@@ -45,8 +45,7 @@ class PositionEmbeddingSine(nn.Module):
     """
     
     def __init__(self, num_pos_feats=128, temperature=10000, normalize=True):
-        if TORCH_AVAILABLE:
-            super().__init__()
+        super().__init__()
         self.num_pos_feats = num_pos_feats
         self.temperature = temperature
         self.normalize = normalize
