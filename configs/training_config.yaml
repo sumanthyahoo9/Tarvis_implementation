@@ -1,0 +1,174 @@
+# configs/training_config.yaml
+# TarViS Training Configuration
+
+# Model Configuration
+model:
+  name: "tarvis"
+  backbone: "resnet50"
+  hidden_dim: 256
+  num_decoder_layers: 6
+  num_heads: 8
+  dim_feedforward: 2048
+  dropout: 0.1
+  
+  # Task-specific settings
+  num_queries_per_object: 4  # VOS
+  num_instance_queries: 100   # VIS
+  num_background_queries: 16
+
+# Dataset Configuration
+data:
+  # Training datasets (multi-task)
+  train_datasets:
+    - name: "davis"
+      task: "vos"
+      root: "/path/to/DAVIS"
+      split: "train"
+      weight: 1.0
+    
+    - name: "youtube_vis_2021"
+      task: "vis"
+      root: "/path/to/YouTubeVIS"
+      split: "train"
+      weight: 1.0
+    
+    - name: "vipseg"
+      task: "vps"
+      root: "/path/to/VIPSeg"
+      split: "train"
+      weight: 1.0
+  
+  # Validation datasets
+  val_datasets:
+    - name: "davis"
+      task: "vos"
+      root: "/path/to/DAVIS"
+      split: "val"
+    
+    - name: "youtube_vis_2021"
+      task: "vis"
+      root: "/path/to/YouTubeVIS"
+      split: "val"
+  
+  # Data loading
+  batch_size: 2
+  num_workers: 4
+  prefetch_factor: 2
+  
+  # Video sampling
+  num_frames: 5
+  frame_stride: 2
+  
+  # Augmentation
+  augmentation:
+    horizontal_flip: 0.5
+    color_jitter: 0.4
+    random_resize: [0.8, 1.2]
+    random_crop: [480, 854]
+
+# Training Configuration
+training:
+  num_epochs: 50
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  
+  # Mixed precision
+  use_amp: true
+  
+  # Evaluation
+  eval_every: 1
+  save_every: 5
+  
+  # Checkpoint
+  resume_from: null  # Path to checkpoint or null
+  checkpoint_dir: "checkpoints/tarvis"
+  
+  # Logging
+  log_every: 10
+  tensorboard_dir: "runs/tarvis"
+
+# Optimizer Configuration
+optimizer:
+  name: "adamw"
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+  
+  # Layer-wise LR decay
+  backbone_lr_multiplier: 0.1
+  
+  # Parameter groups
+  no_weight_decay:
+    - "bias"
+    - "norm"
+    - "positional_encoding"
+
+# Scheduler Configuration
+scheduler:
+  name: "cosine"
+  warmup_epochs: 5
+  min_lr: 1.0e-7
+  
+  # Alternative: step scheduler
+  # name: "step"
+  # step_size: 10
+  # gamma: 0.1
+
+# Loss Configuration
+loss:
+  # Mask loss
+  mask_weight: 5.0
+  dice_weight: 5.0
+  
+  # Classification loss (VIS/VPS)
+  class_weight: 2.0
+  
+  # Focal loss
+  use_focal_loss: true
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  
+  # Deep supervision
+  use_intermediate_loss: true
+  intermediate_weight: 0.5
+
+# Hardware Configuration
+hardware:
+  device: "cuda"
+  num_gpus: 1
+  
+  # Distributed training
+  distributed: false
+  dist_backend: "nccl"
+  dist_url: "env://"
+  
+  # DeepSpeed (optional)
+  use_deepspeed: false
+  deepspeed_config: "configs/deepspeed_config.json"
+
+# Task-specific settings
+tasks:
+  vos:
+    num_classes: 0  # No classification
+    evaluate_metric: "J&F"
+  
+  vis:
+    num_classes: 40  # YouTube-VIS 2021
+    evaluate_metric: "mAP"
+  
+  vps:
+    num_classes: 124  # VIPSeg
+    evaluate_metric: "STQ"
+  
+  pet:
+    num_classes: 0
+    evaluate_metric: "J&F"
+
+# Random seed
+seed: 42
+
+# Debug mode
+debug:
+  enabled: false
+  num_batches: 10  # Only train on 10 batches
+  overfit_single_batch: false

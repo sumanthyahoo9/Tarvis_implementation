@@ -292,7 +292,7 @@ class MultiDatasetSemanticEncoder(nn.Module):
         """Get encoder for specific dataset."""
         if not TORCH_AVAILABLE:
             return None
-        return self.semantic_encoders.get(dataset_name)
+        return self.semantic_encoders[dataset_name]
 
 
 if __name__ == "__main__":

@@ -90,6 +90,8 @@ class ObjectEncoder(nn.Module):
         Returns:
             Initial queries [B, O*qo, hidden_dim]
         """
+        print(f"The masks have the shape {masks.shape}")
+        #print(f"The features have the shape {features.shape}")
         B, O, H, W = masks.shape
         _, C, Hf, Wf = features.shape
         
@@ -115,7 +117,7 @@ class ObjectEncoder(nn.Module):
                 
                 # Sum and normalize
                 mask_sum = obj_mask.sum(dim=[2, 3], keepdim=True).clamp(min=1e-5)
-                query = masked_features.sum(dim=[2, 3]) / mask_sum.squeeze()
+                query = masked_features.sum(dim=[2, 3]) / mask_sum.sum(dim=[2, 3]).clamp(min=1e-5)
                 
                 queries.append(query)  # [B, C]
             else:
@@ -140,12 +142,15 @@ class ObjectEncoder(nn.Module):
                         # Pool
                         masked_cell = cell_features * cell_mask
                         cell_sum = cell_mask.sum(dim=[2, 3], keepdim=True).clamp(min=1e-5)
-                        cell_query = masked_cell.sum(dim=[2, 3]) / cell_sum.squeeze()
+                        cell_query = masked_cell.sum(dim=[2, 3]) / cell_sum.sum(dim=[2, 3]).clamp(min=1e-5)
                         
                         queries.append(cell_query)  # [B, C]
         
         # Stack queries [B, O*qo, C]
-        queries = torch.stack(queries, dim=1)
+        # queries is list of [B, C] tensors, length O*qo
+        # Stack to get [O*qo, B, C], then permute to [B, O*qo, C]
+        queries = torch.stack(queries, dim=0)  # [O*qo, B, C]
+        queries = queries.permute(1, 0, 2)     # [B, O*qo, C]
         
         return queries
     
@@ -301,6 +306,8 @@ class ObjectEncoder(nn.Module):
         # Initialize queries
         if masks is not None:
             # VOS: Initialize from masks
+            print(f"The masks after the initialization have the shape {masks.shape}")
+            print(f"The features after the initialization have the shape {features.shape}")
             queries = self._initialize_queries_from_masks(masks, features)
             B, O_qo, C = queries.shape
             O = masks.shape[1]
@@ -523,7 +530,7 @@ class ObjectQueryEncoder(nn.Module):
             }
         
         # Encode objects
-        object_queries = self.object_encoder(features, masks, points)
+        object_queries = self.object_encoder(features, masks=masks, points=points)
         
         # Add background queries
         bg_queries = self.background_queries.unsqueeze(0).expand(
